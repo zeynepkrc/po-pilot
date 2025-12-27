@@ -157,7 +157,12 @@ class Assessment(models.Model):
             ordering = ["course_instance", "assessment_type", "name"]
 
     def clean(self):
-        """Validate that total weights don't exceed 100%."""
+        """
+        Validate that total weights don't exceed 100%.
+        Note: When used in inline formsets, this validation may be incomplete
+        as it only sees existing assessments, not other forms in the formset.
+        The formset's clean() method provides complete validation.
+        """
         from django.db.models import Sum
         has_parent = False
         try:
@@ -166,8 +171,11 @@ class Assessment(models.Model):
         except (AttributeError, ValueError, models.ObjectDoesNotExist):
             pass  
 
-        if self.weight and has_parent:
-            
+        # Only validate if we have a parent instance
+        # For new instances created via inline formsets, formset validation will handle it
+        if self.weight and has_parent and self.pk:
+            # Only validate for existing assessments being edited individually
+            # (not as part of an inline formset)
             existing_total = self.course_instance.assessments.exclude(
                 pk=self.pk
             ).aggregate(total=Sum('weight'))['total'] or 0

@@ -1,4 +1,8 @@
 from django.contrib import admin, messages
+from django.forms.models import BaseInlineFormSet
+from django.forms import ModelForm
+from django.core.exceptions import ValidationError
+from django.db.models import Sum
 from .models import (
     CourseTemplate,
     CourseInstance,
@@ -20,10 +24,122 @@ class LearningOutcomeInline(admin.TabularInline):
     fields = ["code", "description"]
 
 
+class AssessmentForm(ModelForm):
+    """Custom form that skips model-level clean() to avoid conflicts with formset validation."""
+    
+    class Meta:
+        model = Assessment
+        fields = '__all__'
+    
+    def _post_clean(self):
+        """
+        Override _post_clean to skip model's clean() method.
+        The formset's clean() will handle total weight validation.
+        """
+        # Ensure instance exists
+        if self.instance is None:
+            self.instance = self._meta.model()
+        
+        # Store original clean method
+        if hasattr(self.instance, 'clean'):
+            original_clean = self.instance.clean
+        else:
+            original_clean = None
+        
+        # Temporarily replace clean with a no-op on this instance only
+        def skip_clean():
+            pass
+        
+        self.instance.clean = skip_clean
+        
+        try:
+            # Call parent's _post_clean (which will call the disabled clean)
+            super()._post_clean()
+        finally:
+            # Restore original clean method
+            if original_clean:
+                self.instance.clean = original_clean
+            elif hasattr(self.instance.__class__, 'clean'):
+                # Restore from class if instance method was removed
+                delattr(self.instance, 'clean')
+
+
+class AssessmentInlineFormSet(BaseInlineFormSet):
+    """Custom formset to validate total assessment weights don't exceed 100%."""
+    
+    def clean(self):
+        """Validate that total weights of all assessments don't exceed 100%."""
+        if any(self.errors):
+            # Don't validate if there are already errors
+            return
+        
+        # Get the parent instance (CourseInstance)
+        if self.instance and self.instance.pk:
+            course_instance = self.instance
+        else:
+            # For new instances, we can't validate yet as course_instance doesn't exist
+            # But we can still check the forms in the formset
+            course_instance = None
+        
+        # Calculate total weight from all forms in the formset
+        formset_total = 0
+        forms_to_check = []
+        existing_ids = set()
+        
+        for form in self.forms:
+            # Skip empty forms (not filled out) - check if form has any meaningful data
+            if not form.cleaned_data:
+                continue
+            
+            # Skip deleted forms
+            if form.cleaned_data.get('DELETE', False):
+                # If it's an existing assessment being deleted, track its ID
+                if form.instance and form.instance.pk:
+                    existing_ids.add(form.instance.pk)
+                continue
+            
+            # Only count forms that have a weight value
+            weight = form.cleaned_data.get('weight')
+            if weight is not None and weight != '':
+                try:
+                    weight_value = float(weight)
+                    formset_total += weight_value
+                    forms_to_check.append(form)
+                    # Track existing assessment IDs that are being edited (not deleted)
+                    if form.instance and form.instance.pk:
+                        existing_ids.add(form.instance.pk)
+                except (ValueError, TypeError):
+                    # Skip invalid weight values
+                    continue
+        
+        # If editing existing instance, also include existing assessments not in formset
+        existing_total = 0
+        if course_instance and course_instance.pk:
+            # Sum weights of existing assessments not being edited/deleted in this formset
+            existing_total = course_instance.assessments.exclude(
+                pk__in=existing_ids
+            ).aggregate(total=Sum('weight'))['total'] or 0
+        
+        # Calculate final total
+        total_weight = formset_total + float(existing_total)
+        
+        # Check if total is exactly 100%
+        if total_weight != 100:
+            error_msg = f"Total weight is {total_weight:.2f}%. Must be exactly 100%."
+            
+            # Add error to all forms with weight fields
+            for form in forms_to_check:
+                form.add_error('weight', error_msg)
+            
+            raise ValidationError(error_msg)
+
+
 class AssessmentInline(admin.TabularInline):
     model = Assessment
     extra = 1
     fields = ["name", "assessment_type", "max_score", "weight"]
+    form = AssessmentForm
+    formset = AssessmentInlineFormSet
 
 
 class AssessmentToLOInline(admin.TabularInline):
